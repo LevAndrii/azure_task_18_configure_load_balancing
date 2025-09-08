@@ -110,52 +110,68 @@ $net = @{
 }
 $vnet = Get-AzVirtualNetwork @net
 
-$lbip = @{
-    Name = 'myFrontEnd'
-    PrivateIpAddress = $lbIpAddress
-    SubnetId = $webSubnetId
-}
-$feip = New-AzLoadBalancerFrontendIpConfig @lbip
+$lbip = New-AzLoadBalancerFrontendIpConfig `
+    -Name "myFrontEnd" `
+    -PrivateIpAddress $lbIpAddress `
+    -PrivateIpAllocationMethod Static `
+    -SubnetId $webSubnetId
 
-$bepool = New-AzLoadBalancerBackendAddressPoolConfig -Name 'myBackEndPool'
+$bepoolConfig = New-AzLoadBalancerBackendAddressPoolConfig -Name 'myBackEndPool'
 
-$probe = @{
-    Name = 'myHealthProbe'
-    Protocol = 'tcp'
-    Port = '8080'
-    IntervalInSeconds = '360'
-    ProbeCount = '5'
-}
-$healthprobe = New-AzLoadBalancerProbeConfig @probe
+$healthprobe = New-AzLoadBalancerProbeConfig -Name 'myHealthProbe' -Protocol Tcp -Port 8080 -IntervalInSeconds 15 -ProbeCount 2
 
-$lbrule = @{
-    Name = 'myHTTPRule'
-    Protocol = 'tcp'
-    FrontendPort = '80'
-    BackendPort = '8080'
-    IdleTimeoutInMinutes = '15'
-    FrontendIpConfiguration = $feip
-    BackendAddressPool = $bepool
-}
-$rule = New-AzLoadBalancerRuleConfig @lbrule -EnableTcpReset
+$rule = New-AzLoadBalancingRuleConfig -Name 'myHTTPRule' `
+    -FrontendIpConfiguration $lbip `
+    -BackendAddressPool $bepoolConfig `
+    -Probe $healthprobe `
+    -Protocol Tcp -FrontendPort 80 -BackendPort 8080 -IdleTimeoutInMinutes 15 `
+    -EnableTcpReset
 
-$loadbalancer = @{
-    ResourceGroupName = $resourceGroupName
-    Name =  $lbName
-    Location = $location
-    Sku = 'Standard'
-    FrontendIpConfiguration = $feip
-    BackendAddressPool = $bepool
-    LoadBalancingRule = $rule
-    Probe = $healthprobe
+$lb = New-AzLoadBalancer -ResourceGroupName $resourceGroupName `
+    -Name $lbName -Location $location -Sku Standard `
+    -FrontendIpConfiguration $lbip `
+    -BackendAddressPool $bepoolConfig `
+    -Probe $healthprobe `
+    -LoadBalancingRule $rule
+
+Write-Host "Load balancer created: $($lb.Name). Frontend IP: $lbIpAddress"
+
+$backendPool = $lb.BackendAddressPools | Where-Object { $_.Name -eq 'myBackEndPool' }
+if (-not $backendPool) {
+    $backendPool = Get-AzLoadBalancerBackendAddressPool -ResourceGroupName $resourceGroupName -LoadBalancerName $lbName -Name 'myBackEndPool'
 }
-New-AzLoadBalancer @loadbalancer
+
+$webNsg = Get-AzNetworkSecurityGroup -Name $webSubnetName -ResourceGroupName $resourceGroupName
+$exists = $webNsg.SecurityRules | Where-Object { $_.Name -eq 'allow-8080-from-vnet' }
+if (-not $exists) {
+    $allow8080 = New-AzNetworkSecurityRuleConfig -Name 'allow-8080-from-vnet' `
+        -Description 'Allow LB/probe/data path from VNet to port 8080' `
+        -Access Allow -Protocol Tcp -Direction Inbound -Priority 200 `
+        -SourceAddressPrefix VirtualNetwork -SourcePortRange * -DestinationAddressPrefix * -DestinationPortRange 8080
+    $webNsg.SecurityRules += $allow8080
+    Set-AzNetworkSecurityGroup -NetworkSecurityGroup $webNsg
+    Write-Host "Added NSG rule allow-8080-from-vnet to web NSG"
+}
 
 Write-Host "Adding VMs to the backend pool"
-$vms = Get-AzVm -ResourceGroupName $resourceGroupName | Where-Object {$_.Name.StartsWith($webVmName)}
+$vms = Get-AzVm -ResourceGroupName $resourceGroupName | Where-Object { $_.Name -like "$webVmName-*" }
 foreach ($vm in $vms) {
-    $nic = Get-AzNetworkInterface -ResourceGroupName $resourceGroupName | Where-Object {$_.Id -eq $vm.NetworkProfile.NetworkInterfaces.Id}
-    $ipCfg = $nic.IpConfigurations | Where-Object {$_.Primary}
-    $ipCfg.LoadBalancerBackendAddressPools.Add($bepool)
+
+    $nicId = $vm.NetworkProfile.NetworkInterfaces[0].Id
+    $nic = Get-AzNetworkInterface -ResourceId $nicId
+
+    $ipCfg = $nic.IpConfigurations | Where-Object { $_.Primary -eq $true }
+    if (-not $ipCfg) { $ipCfg = $nic.IpConfigurations[0] }
+
+    if ($null -eq $ipCfg.LoadBalancerBackendAddressPools) {
+        $ipCfg.LoadBalancerBackendAddressPools = @($backendPool)
+    } else {
+        if (-not ($ipCfg.LoadBalancerBackendAddressPools | Where-Object { $_.Id -eq $backendPool.Id })) {
+            $ipCfg.LoadBalancerBackendAddressPools += $backendPool
+        }
+    }
+
     Set-AzNetworkInterface -NetworkInterface $nic
- }
+    Write-Host "Assigned NIC $($nic.Name) to backend pool"
+}
+
