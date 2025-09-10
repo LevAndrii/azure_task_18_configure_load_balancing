@@ -18,13 +18,16 @@ $jumpboxVmName = "jumpbox"
 $dnsLabel = "matetask" + (Get-Random -Count 1)
 
 $privateDnsZoneName = "or.nottodo"
+$dnsRecordName = "todo"
 
 $lbName = "loadbalancer"
 $lbIpAddress = "10.20.30.62"
 
 
 Write-Host "Creating a resource group $resourceGroupName ..."
-New-AzResourceGroup -Name $resourceGroupName -Location $location
+if (-not (Get-AzResourceGroup -Name $resourceGroupName -ErrorAction SilentlyContinue)) {
+    New-AzResourceGroup -Name $resourceGroupName -Location $location
+}
 
 Write-Host "Creating web network security group..."
 $webHttpRule = New-AzNetworkSecurityRuleConfig -Name "web" -Description "Allow HTTP" `
@@ -89,20 +92,34 @@ New-AzVm `
 
 
 Write-Host "Creating a private DNS zone ..."
-$Zone = New-AzPrivateDnsZone -Name $privateDnsZoneName -ResourceGroupName $resourceGroupName 
-$Link = New-AzPrivateDnsVirtualNetworkLink -ZoneName $privateDnsZoneName -ResourceGroupName $resourceGroupName -Name $Zone.Name -VirtualNetworkId $virtualNetwork.Id -EnableRegistration
-
+# Check if dns zone already exists and create it if not
+$zone = Get-AzPrivateDnsZone -Name $privateDnsZoneName -ResourceGroupName $resourceGroupName -ErrorAction SilentlyContinue
+if (-not $zone) {
+    $zone = New-AzPrivateDnsZone -Name $privateDnsZoneName -ResourceGroupName $resourceGroupName
+}
+# Link zone to VNet
+$linkName = "${privateDnsZoneName}-link"
+$link = Get-AzPrivateDnsVirtualNetworkLink -ZoneName $privateDnsZoneName -ResourceGroupName $resourceGroupName -Name $linkName -ErrorAction SilentlyContinue
+if (-not $link) {
+    New-AzPrivateDnsVirtualNetworkLink -ZoneName $privateDnsZoneName -ResourceGroupName $resourceGroupName -Name $linkName -VirtualNetworkId $vnet.Id -EnableRegistration
+}
 
 Write-Host "Creating an A DNS record ..."
-$Records = @()
-$Records += New-AzPrivateDnsRecordConfig -IPv4Address $lbIpAddress
-New-AzPrivateDnsRecordSet -Name "todo" -RecordType A -ResourceGroupName $resourceGroupName -TTL 1800 -ZoneName $privateDnsZoneName -PrivateDnsRecords $Records
+$record = Get-AzPrivateDnsRecordSet -Name $dnsRecordName -RecordType A -ZoneName $privateDnsZoneName -ResourceGroupName $resourceGroupName -ErrorAction SilentlyContinue
+if ($record) {
+    $record.Records.Clear()
+    Add-AzPrivateDnsRecordConfig -RecordSet $record -IPv4Address $lbIpAddress
+    Set-AzPrivateDnsRecordSet -RecordSet $record
+}
+else {
+    New-AzPrivateDnsRecordSet -Name $dnsRecordName -RecordType A -ZoneName $privateDnsZoneName -ResourceGroupName $resourceGroupName -Ttl 3600 -PrivateDnsRecords (New-AzPrivateDnsRecordConfig -IPv4Address $lbIpAddress)
+}
 
 # Prepare variables, required for creation and configuration of load balancer -
 # you will need them to setup a load balancer 
 $webSubnetId = (Get-AzVirtualNetworkSubnetConfig -Name $webSubnetName -VirtualNetwork $virtualNetwork).Id
 
-# Write your code here -> 
+# Write your code here ->
 Write-Host "Creating a load balancer ..."
 $net = @{
     Name = $virtualNetworkName
@@ -174,4 +191,3 @@ foreach ($vm in $vms) {
     Set-AzNetworkInterface -NetworkInterface $nic
     Write-Host "Assigned NIC $($nic.Name) to backend pool"
 }
-
